@@ -7,6 +7,7 @@ import (
 
     "waf-automator/internal/cloudflare"
     "waf-automator/internal/config"
+	"waf-automator/internal/notify"
 )
 
 // State merepresentasikan status current dari state machine
@@ -40,10 +41,13 @@ type Monitor struct {
     gqlClient    *cloudflare.GraphQLClient
     wafClient    *cloudflare.WAFClient
     allowRuleExpr string // Expression dari rule "allow" - jangan sampai hilang saat PATCH
+	telegram     *notify.TelegramNotifier
 
     currentState     State
     breachStartTime  time.Time // Kapan RPS mulai breach
     stableStartTime  time.Time // Kapan RPS mulai stabil (untuk cooldown)
+    pollCount    int64
+    stateEnteredAt time.Time 
 
     notifier Notifier
 }

@@ -1,0 +1,17 @@
+services:
+  waf-automator:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Resource limits - service ini sangat ringan
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 64M

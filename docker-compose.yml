@@ -4,13 +4,13 @@
 # Perintah umum:
 #   Start    : docker compose up -d
 #   Stop     : docker compose down
-#   Logs     : docker compose logs -f waf-automator
-#   Restart  : docker compose restart waf-automator
+#   Logs     : docker compose logs -f waf-attacker-automator
+#   Restart  : docker compose restart waf-attacker-automator
 #   Rebuild  : docker compose up -d --build
 # =============================================================================
 
 services:
-  waf-automator:
+  waf-attacker-automator:
     build:
       context: .
       dockerfile: Dockerfile
@@ -18,7 +18,7 @@ services:
         # Version akan tampil di log startup dan notifikasi Telegram
         VERSION: "1.0.0"
 
-    container_name: waf-automator
+    container_name: waf-attacker-automator
 
     # Restart otomatis kecuali di-stop manual
     # "unless-stopped" lebih aman dari "always" karena tidak restart
@@ -31,9 +31,9 @@ services:
 
     # Health check: pastikan process masih hidup setiap 30 detik
     # Karena binary ini adalah long-running process (bukan HTTP server),
-    # kita cek apakah process dengan nama "waf-automator" masih ada
+    # kita cek apakah process dengan nama "waf-attacker-automator" masih ada
     healthcheck:
-      test: ["CMD-SHELL", "pgrep waf-automator || exit 1"]
+      test: ["CMD-SHELL", "pgrep waf-attacker-automator || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

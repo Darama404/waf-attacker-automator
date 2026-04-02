@@ -26,7 +26,7 @@ COPY . .
 ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-w -s -X main.version=${VERSION}" \
-    -o /waf-automator \
+    -o /waf-attacker-automator \
     ./cmd/main.go
 
 # =============================================================================
@@ -43,7 +43,7 @@ COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
 # Copy binary dari stage builder
-COPY --from=builder /waf-automator /waf-automator
+COPY --from=builder /waf-attacker-automator /waf-attacker-automator
 
 # Jalankan sebagai non-root user (distroless menyediakan user "nonroot" dengan UID 65532)
 USER nonroot:nonroot

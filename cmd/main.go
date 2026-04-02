@@ -9,10 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"waf-automator/internal/cloudflare"
-	"waf-automator/internal/config"
-	"waf-automator/internal/monitor"
-	"waf-automator/internal/notify"
+	"waf-attacker-automator/internal/cloudflare"
+	"waf-attacker-automator/internal/config"
+	"waf-attacker-automator/internal/monitor"
+	"waf-attacker-automator/internal/notify"
 )
 
 // version diisi saat build menggunakan ldflags:

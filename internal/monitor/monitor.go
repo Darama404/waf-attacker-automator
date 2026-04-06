@@ -4,26 +4,26 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"waf-attacker-automator/internal/cloudflare"
-	"waf-attacker-automator/internal/config"
-	"waf-attacker-automator/internal/notify"
+	"waf-automator/internal/cloudflare"
+	"waf-automator/internal/config"
+	"waf-automator/internal/notify"
 )
 
 // ---------------------------------------------------------------------------
 // State Machine
 // ---------------------------------------------------------------------------
 
-// State merepresentasikan kondisi monitor saat ini.
 type State int32
 
 const (
-	StateNormal      State = iota // Traffic normal, WAF rule = skip
-	StateBreaching                // RPS melewati threshold, sedang menghitung durasi
-	StateMitigating               // Rule sudah diubah ke managed_challenge
-	StateCoolingDown              // RPS turun, sedang menghitung cooldown
+	StateNormal      State = iota
+	StateBreaching
+	StateMitigating
+	StateCoolingDown
 )
 
 func (s State) String() string {
@@ -42,239 +42,188 @@ func (s State) String() string {
 }
 
 // ---------------------------------------------------------------------------
-// Monitor
+// ZoneMonitor — Monitor untuk satu zone
 // ---------------------------------------------------------------------------
 
-// Monitor adalah komponen utama yang menjalankan polling loop dan state machine.
-type Monitor struct {
-	cfg       *config.Config
-	gql       *cloudflare.GraphQLClient
-	waf       *cloudflare.WAFClient
-	telegram  *notify.TelegramNotifier
+// ZoneMonitor menjalankan state machine untuk satu zone secara independen.
+// Setiap zone punya goroutine sendiri sehingga serangan di satu domain
+// tidak mempengaruhi polling atau state domain lain.
+type ZoneMonitor struct {
+	cfg      *config.Config
+	rule     *cloudflare.ZoneRule // Rule yang ditemukan saat startup
+	gql      *cloudflare.GraphQLClient
+	waf      *cloudflare.WAFClient
+	telegram *notify.TelegramNotifier
 
-	// Expression asli rule "allow" — wajib disertakan saat PATCH ke Cloudflare API.
-	// Jangan sampai hilang, karena PATCH tanpa expression akan error.
-	allowRuleExpr string
-
-	// --- State machine fields ---
+	// State machine
 	currentState   State
-	stateEnteredAt time.Time // Kapan masuk ke state saat ini (untuk hitung durasi)
-	breachStartAt  time.Time // Kapan RPS pertama kali melewati threshold
-	stableStartAt  time.Time // Kapan RPS mulai stabil di bawah threshold (cooldown)
+	stateEnteredAt time.Time
+	breachStartAt  time.Time
+	stableStartAt  time.Time
 
-	// --- Metrics ---
-	pollCount int64 // Atomic counter — aman untuk concurrent access
+	// Metrics
+	pollCount int64
 }
 
-// New membuat instance Monitor baru.
-// telegram boleh nil jika notifikasi Telegram tidak dikonfigurasi.
-func New(cfg *config.Config, telegram *notify.TelegramNotifier) *Monitor {
-	return &Monitor{
+func newZoneMonitor(
+	cfg *config.Config,
+	rule *cloudflare.ZoneRule,
+	telegram *notify.TelegramNotifier,
+) *ZoneMonitor {
+	return &ZoneMonitor{
 		cfg:      cfg,
-		gql:      cloudflare.NewGraphQLClient(cfg.CFApiToken, cfg.CFZoneID),
-		waf:      cloudflare.NewWAFClient(cfg.CFApiToken, cfg.CFZoneID, cfg.CFRulesetID, cfg.CFRuleID),
+		rule:     rule,
+		gql:      cloudflare.NewGraphQLClient(cfg.CFApiToken, rule.ZoneID),
+		waf:      cloudflare.NewWAFClient(cfg.CFApiToken, rule.ZoneID, rule.RulesetID, rule.RuleID),
 		telegram: telegram,
-
-		// PENTING: Nilai ini harus identik dengan expression yang ada di Cloudflare dashboard.
-		// Cloudflare API mengharuskan expression disertakan saat update rule.
-		// Idealnya diambil via GET /rulesets/{id} saat startup — lihat fungsi loadRuleExpression().
-		allowRuleExpr: `(ip.src.country in {"KH" "ID" "MY" "LK" "HK"}) or (ip.src in $allow_ip_third_party)`,
 
 		currentState:   StateNormal,
 		stateEnteredAt: time.Now(),
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Run — Entry Point
-// ---------------------------------------------------------------------------
-
-// Run memulai polling loop utama. Blocking sampai ctx dibatalkan.
-// Gunakan signal.NotifyContext di main.go untuk graceful shutdown.
-func (m *Monitor) Run(ctx context.Context) {
-	slog.Info("WAF Monitor started",
-		"zone_id", m.cfg.CFZoneID,
-		"poll_interval", m.cfg.PollInterval,
-		"rps_threshold", m.cfg.RPSThreshold,
-		"trigger_duration", m.cfg.TriggerDuration,
-		"cooldown_duration", m.cfg.CooldownDuration,
-	)
-
-	// Opsional: ambil expression rule dari API saat startup supaya tidak hardcode.
-	// Uncomment baris di bawah jika ingin dynamic:
-	// if err := m.loadRuleExpression(ctx); err != nil {
-	//     slog.Warn("Could not load rule expression from API, using default", "error", err)
-	// }
-
-	ticker := time.NewTicker(m.cfg.PollInterval)
+// run adalah polling loop untuk satu zone. Dipanggil dalam goroutine terpisah.
+func (zm *ZoneMonitor) run(ctx context.Context) {
+	ticker := time.NewTicker(zm.cfg.PollInterval)
 	defer ticker.Stop()
 
-	// Jalankan satu kali langsung saat start — jangan tunggu tick pertama.
-	m.tick(ctx)
+	slog.Info("Zone monitor started",
+		"zone", zm.rule.ZoneName,
+		"rule", zm.rule.Description,
+		"rule_id", zm.rule.RuleID,
+	)
+
+	// Jalankan sekali langsung saat start
+	zm.tick(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("Monitor received shutdown signal, exiting cleanly")
+			slog.Info("Zone monitor stopping", "zone", zm.rule.ZoneName)
 			return
 		case <-ticker.C:
-			m.tick(ctx)
+			zm.tick(ctx)
 		}
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Tick — Satu Siklus Poll
-// ---------------------------------------------------------------------------
+func (zm *ZoneMonitor) tick(ctx context.Context) {
+	count := atomic.AddInt64(&zm.pollCount, 1)
 
-// tick adalah satu siklus: fetch RPS → evaluasi state → kirim notifikasi Telegram.
-func (m *Monitor) tick(ctx context.Context) {
-	count := atomic.AddInt64(&m.pollCount, 1)
-
-	// Fetch RPS dengan retry dan exponential backoff.
-	rps, err := m.fetchRPSWithRetry(ctx, 3)
+	rps, err := zm.fetchRPSWithRetry(ctx, 3)
 	if err != nil {
-		slog.Error("Failed to fetch RPS after all retries — skipping this tick",
+		slog.Error("Failed to fetch RPS",
+			"zone", zm.rule.ZoneName,
 			"error", err,
 			"poll", count,
 		)
-		// Fail-safe: jangan ubah state jika data tidak tersedia.
-		// Lebih baik false negative daripada false positive yang mengubah rule.
 		return
 	}
 
 	slog.Info("RPS polled",
+		"zone", zm.rule.ZoneName,
 		"rps", fmt.Sprintf("%.1f", rps),
-		"threshold", m.cfg.RPSThreshold,
-		"state", m.currentState.String(),
-		"poll", count,
+		"threshold", zm.cfg.RPSThreshold,
+		"state", zm.currentState.String(),
 	)
 
-	// Jalankan state machine.
-	m.evaluate(ctx, rps)
+	zm.evaluate(ctx, rps)
 
-	// Kirim live status update ke Telegram (edit pesan yang sama — tidak spam).
-	m.sendStatusUpdate(ctx, rps, count)
+	// Update Telegram status (edit message strategy)
+	zm.sendStatusUpdate(ctx, rps, count)
 }
 
 // ---------------------------------------------------------------------------
-// State Machine — evaluate()
+// State Machine
 // ---------------------------------------------------------------------------
 
-// evaluate adalah inti state machine. Dipanggil setiap tick.
-func (m *Monitor) evaluate(ctx context.Context, rps float64) {
-	isBreaching := rps > m.cfg.RPSThreshold
+func (zm *ZoneMonitor) evaluate(ctx context.Context, rps float64) {
+	isBreaching := rps > zm.cfg.RPSThreshold
 	now := time.Now()
 
-	switch m.currentState {
+	switch zm.currentState {
 
-	// -----------------------------------------------------------------------
 	case StateNormal:
 		if isBreaching {
-			slog.Warn("RPS breach detected — starting trigger timer",
+			slog.Warn("RPS breach detected",
+				"zone", zm.rule.ZoneName,
 				"rps", rps,
-				"threshold", m.cfg.RPSThreshold,
 			)
-			m.breachStartAt = now
-			m.transitionTo(StateBreaching)
+			zm.breachStartAt = now
+			zm.transitionTo(StateBreaching)
 		}
-		// Tidak ada aksi jika RPS masih normal.
 
-	// -----------------------------------------------------------------------
 	case StateBreaching:
 		if !isBreaching {
-			// RPS turun sendiri sebelum mencapai trigger duration.
-			// Ini bisa false spike — kembali ke Normal tanpa aksi apapun.
-			slog.Info("RPS normalized before trigger duration — returning to NORMAL",
-				"breach_duration", now.Sub(m.breachStartAt).Round(time.Second),
+			slog.Info("RPS normalized before trigger",
+				"zone", zm.rule.ZoneName,
+				"breach_duration", now.Sub(zm.breachStartAt).Round(time.Second),
 			)
-			m.transitionTo(StateNormal)
+			zm.transitionTo(StateNormal)
 			return
 		}
 
-		elapsed := now.Sub(m.breachStartAt)
-		remaining := m.cfg.TriggerDuration - elapsed
-
-		slog.Warn("RPS still breaching",
-			"rps", rps,
-			"elapsed", elapsed.Round(time.Second),
-			"remaining_until_trigger", remaining.Round(time.Second),
-		)
-
-		if elapsed >= m.cfg.TriggerDuration {
-			// Threshold terlampaui selama durasi yang ditentukan → TRIGGER mitigasi.
+		elapsed := now.Sub(zm.breachStartAt)
+		if elapsed >= zm.cfg.TriggerDuration {
 			slog.Warn("Trigger duration exceeded — activating mitigation",
+				"zone", zm.rule.ZoneName,
 				"rps", rps,
 				"breach_duration", elapsed.Round(time.Second),
 			)
-			if err := m.activateMitigation(ctx, rps); err != nil {
-				slog.Error("Failed to activate mitigation — will retry next tick", "error", err)
-				// Jangan transisi state jika API call gagal.
-				// Akan dicoba lagi di tick berikutnya.
+			if err := zm.activateMitigation(ctx, rps); err != nil {
+				slog.Error("Failed to activate mitigation",
+					"zone", zm.rule.ZoneName,
+					"error", err,
+				)
 				return
 			}
-			m.transitionTo(StateMitigating)
+			zm.transitionTo(StateMitigating)
 		}
 
-	// -----------------------------------------------------------------------
 	case StateMitigating:
 		if !isBreaching {
-			// RPS mulai turun. Mulai hitung cooldown.
-			slog.Info("RPS dropped below threshold during mitigation — starting cooldown",
-				"rps", rps,
-				"threshold", m.cfg.RPSThreshold,
+			slog.Info("RPS dropped — starting cooldown",
+				"zone", zm.rule.ZoneName,
 			)
-			m.stableStartAt = now
-			m.transitionTo(StateCoolingDown)
-		} else {
-			slog.Warn("Attack still ongoing during mitigation",
-				"rps", rps,
-				"mitigating_for", now.Sub(m.stateEnteredAt).Round(time.Second),
-			)
+			zm.stableStartAt = now
+			zm.transitionTo(StateCoolingDown)
 		}
 
-	// -----------------------------------------------------------------------
 	case StateCoolingDown:
 		if isBreaching {
-			// RPS naik lagi selama cooldown — reset timer cooldown.
-			// Jangan deactivate mitigasi dulu.
-			slog.Warn("RPS spiked again during cooldown — resetting cooldown timer",
+			slog.Warn("RPS spiked during cooldown — resetting timer",
+				"zone", zm.rule.ZoneName,
 				"rps", rps,
 			)
-			m.stableStartAt = now
+			zm.stableStartAt = now
 			return
 		}
 
-		elapsed := now.Sub(m.stableStartAt)
-		remaining := m.cfg.CooldownDuration - elapsed
-
-		slog.Info("Cooldown in progress",
-			"rps", rps,
-			"stable_for", elapsed.Round(time.Second),
-			"remaining", remaining.Round(time.Second),
-		)
-
-		if elapsed >= m.cfg.CooldownDuration {
-			// Cooldown selesai → kembalikan rule ke skip.
-			slog.Info("Cooldown complete — deactivating mitigation")
-			if err := m.deactivateMitigation(ctx); err != nil {
-				slog.Error("Failed to deactivate mitigation — will retry next tick", "error", err)
-				// Jangan transisi state jika API call gagal.
+		elapsed := now.Sub(zm.stableStartAt)
+		if elapsed >= zm.cfg.CooldownDuration {
+			slog.Info("Cooldown complete — restoring rule",
+				"zone", zm.rule.ZoneName,
+			)
+			if err := zm.deactivateMitigation(ctx); err != nil {
+				slog.Error("Failed to deactivate mitigation",
+					"zone", zm.rule.ZoneName,
+					"error", err,
+				)
 				return
 			}
-			m.transitionTo(StateNormal)
+			zm.transitionTo(StateNormal)
 		}
 	}
 }
 
-// transitionTo mengubah state dan mencatat waktu masuk state baru.
-func (m *Monitor) transitionTo(newState State) {
-	oldState := m.currentState
-	m.currentState = newState
-	m.stateEnteredAt = time.Now()
+func (zm *ZoneMonitor) transitionTo(s State) {
+	old := zm.currentState
+	zm.currentState = s
+	zm.stateEnteredAt = time.Now()
 	slog.Info("State transition",
-		"from", oldState.String(),
-		"to", newState.String(),
+		"zone", zm.rule.ZoneName,
+		"from", old.String(),
+		"to", s.String(),
 	)
 }
 
@@ -282,94 +231,72 @@ func (m *Monitor) transitionTo(newState State) {
 // WAF Actions
 // ---------------------------------------------------------------------------
 
-// activateMitigation mengubah rule action dari "skip" menjadi "managed_challenge".
-// Dipanggil saat RPS melewati threshold selama TriggerDuration.
-func (m *Monitor) activateMitigation(ctx context.Context, rps float64) error {
-	slog.Info("Calling Cloudflare API: skip → managed_challenge")
-
-	// Beri timeout tersendiri untuk API call ini — jangan blok polling loop terlalu lama.
+func (zm *ZoneMonitor) activateMitigation(ctx context.Context, rps float64) error {
 	apiCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	if err := m.waf.SetRuleAction(apiCtx, cloudflare.ActionManagedChallenge, m.allowRuleExpr); err != nil {
-		return fmt.Errorf("cloudflare API call failed: %w", err)
+	if err := zm.waf.SetRuleAction(apiCtx, cloudflare.ActionManagedChallenge, zm.rule.Expression); err != nil {
+		return fmt.Errorf("cloudflare PATCH failed: %w", err)
 	}
 
-	slog.Warn("🚨 Mitigation ACTIVATED — rule changed to managed_challenge",
+	slog.Warn("Mitigation ACTIVATED",
+		"zone", zm.rule.ZoneName,
 		"rps", rps,
-		"threshold", m.cfg.RPSThreshold,
 	)
 
-	// Kirim alert Telegram — pesan baru (bukan edit) karena ini event penting.
-	if m.telegram != nil {
-		tgCtx, tgCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer tgCancel()
-
-		if err := m.telegram.NotifyMitigationActivated(tgCtx, m.cfg.CFZoneID, rps, m.cfg.RPSThreshold); err != nil {
-			// Non-fatal — jangan gagalkan mitigasi hanya karena Telegram error.
-			slog.Warn("Telegram alert failed (mitigation activated)", "error", err)
+	if zm.telegram != nil {
+		tgCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if err := zm.telegram.NotifyMitigationActivated(tgCtx, zm.rule.ZoneName, rps, zm.cfg.RPSThreshold); err != nil {
+			slog.Warn("Telegram alert failed", "zone", zm.rule.ZoneName, "error", err)
 		}
 	}
-
 	return nil
 }
 
-// deactivateMitigation mengembalikan rule action dari "managed_challenge" ke "skip".
-// Dipanggil setelah RPS stabil di bawah threshold selama CooldownDuration.
-func (m *Monitor) deactivateMitigation(ctx context.Context) error {
-	slog.Info("Calling Cloudflare API: managed_challenge → skip")
-
+func (zm *ZoneMonitor) deactivateMitigation(ctx context.Context) error {
 	apiCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	if err := m.waf.SetRuleAction(apiCtx, cloudflare.ActionSkip, m.allowRuleExpr); err != nil {
-		return fmt.Errorf("cloudflare API call failed: %w", err)
+	if err := zm.waf.SetRuleAction(apiCtx, cloudflare.ActionSkip, zm.rule.Expression); err != nil {
+		return fmt.Errorf("cloudflare PATCH failed: %w", err)
 	}
 
-	slog.Info("✅ Mitigation DEACTIVATED — rule restored to skip",
-		"cooldown_duration", m.cfg.CooldownDuration,
-	)
+	slog.Info("Mitigation DEACTIVATED", "zone", zm.rule.ZoneName)
 
-	// Kirim alert Telegram — pesan baru karena ini event penting.
-	if m.telegram != nil {
-		tgCtx, tgCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer tgCancel()
-
-		if err := m.telegram.NotifyMitigationDeactivated(tgCtx, m.cfg.CFZoneID, m.cfg.CooldownDuration.Minutes()); err != nil {
-			slog.Warn("Telegram alert failed (mitigation deactivated)", "error", err)
+	if zm.telegram != nil {
+		tgCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if err := zm.telegram.NotifyMitigationDeactivated(tgCtx, zm.rule.ZoneName, zm.cfg.CooldownDuration.Minutes()); err != nil {
+			slog.Warn("Telegram alert failed", "zone", zm.rule.ZoneName, "error", err)
 		}
 	}
-
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// Telegram Status Update
+// Telegram Status
 // ---------------------------------------------------------------------------
 
-// sendStatusUpdate mengirim/mengedit pesan live status di Telegram setiap polling.
-// Menggunakan strategi edit message supaya group tidak dibanjiri pesan.
-func (m *Monitor) sendStatusUpdate(ctx context.Context, rps float64, pollCount int64) {
-	if m.telegram == nil {
+func (zm *ZoneMonitor) sendStatusUpdate(ctx context.Context, rps float64, pollCount int64) {
+	if zm.telegram == nil {
 		return
 	}
-
 	tgCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	report := &notify.StatusReport{
-		Zone:          m.cfg.CFZoneID,
+		Zone:          zm.rule.ZoneName,
 		CurrentRPS:    rps,
-		Threshold:     m.cfg.RPSThreshold,
-		State:         m.currentState.String(),
+		Threshold:     zm.cfg.RPSThreshold,
+		State:         zm.currentState.String(),
 		PollCount:     pollCount,
 		LastPollTime:  time.Now(),
-		StateDuration: time.Since(m.stateEnteredAt),
+		StateDuration: time.Since(zm.stateEnteredAt),
 	}
 
-	if err := m.telegram.UpdateStatusMessage(tgCtx, report); err != nil {
-		// Non-fatal — status update bukan critical path.
-		slog.Warn("Telegram status update failed", "error", err)
+	if err := zm.telegram.UpdateStatusMessage(ctx, tgCtx, zm.rule.ZoneID, report); err != nil {
+		slog.Warn("Telegram status update failed", "zone", zm.rule.ZoneName, "error", err)
 	}
 }
 
@@ -377,85 +304,49 @@ func (m *Monitor) sendStatusUpdate(ctx context.Context, rps float64, pollCount i
 // RPS Fetch dengan Retry
 // ---------------------------------------------------------------------------
 
-// fetchRPSWithRetry memanggil Cloudflare GraphQL API dengan retry dan exponential backoff.
-//
-// Backoff schedule (maxRetries=3):
-//   - Attempt 1: langsung
-//   - Attempt 2: tunggu 5 detik
-//   - Attempt 3: tunggu 10 detik
-//
-// Jika rate limited (429), backoff lebih panjang diterapkan otomatis.
-func (m *Monitor) fetchRPSWithRetry(ctx context.Context, maxRetries int) (float64, error) {
+func (zm *ZoneMonitor) fetchRPSWithRetry(ctx context.Context, maxRetries int) (float64, error) {
 	var lastErr error
-
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
-			// Exponential backoff: 5s → 10s → 20s
 			backoff := time.Duration(5<<uint(attempt-1)) * time.Second
-
-			// Jika error sebelumnya adalah rate limit, tambah backoff ekstra.
 			if isRateLimitError(lastErr) {
-				backoff = backoff * 3
-				slog.Warn("Rate limited by Cloudflare, applying extended backoff",
-					"backoff", backoff,
-					"attempt", attempt+1,
-				)
-			} else {
-				slog.Info("Retrying RPS fetch",
-					"attempt", attempt+1,
-					"backoff", backoff,
-					"last_error", lastErr,
-				)
+				backoff *= 3
 			}
-
 			select {
 			case <-ctx.Done():
-				return 0, fmt.Errorf("context cancelled during retry backoff: %w", ctx.Err())
+				return 0, ctx.Err()
 			case <-time.After(backoff):
 			}
 		}
 
-		// Beri timeout per attempt — jangan tunggu indefinitely.
 		fetchCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-		rps, err := m.gql.GetAllowRuleRPS(fetchCtx, m.cfg.CFRuleID)
+		rps, err := zm.gql.GetAllowRuleRPS(fetchCtx, zm.rule.RuleID)
 		cancel()
 
 		if err == nil {
-			if attempt > 0 {
-				slog.Info("RPS fetch succeeded after retry", "attempt", attempt+1)
-			}
 			return rps, nil
 		}
-
 		lastErr = err
 		slog.Warn("RPS fetch attempt failed",
+			"zone", zm.rule.ZoneName,
 			"attempt", attempt+1,
-			"max_retries", maxRetries,
 			"error", err,
 		)
 	}
-
-	return 0, fmt.Errorf("all %d attempts failed, last error: %w", maxRetries, lastErr)
+	return 0, fmt.Errorf("all %d attempts failed: %w", maxRetries, lastErr)
 }
 
-// isRateLimitError memeriksa apakah error adalah rate limit dari Cloudflare.
 func isRateLimitError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// GraphQL client kita meng-wrap error 429 dengan string ini.
-	return contains(err.Error(), "rate limited") || contains(err.Error(), "429")
+	s := err.Error()
+	return contains(s, "429") || contains(s, "rate limited")
 }
 
-// contains adalah helper sederhana — menghindari import "strings" hanya untuk ini.
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr ||
-		len(s) > 0 && containsHelper(s, substr))
-}
-
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
+func contains(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
 			return true
 		}
 	}
@@ -463,46 +354,160 @@ func containsHelper(s, substr string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Optional: Load Rule Expression dari Cloudflare API
+// MultiMonitor — Orchestrator semua ZoneMonitor
 // ---------------------------------------------------------------------------
 
-// loadRuleExpression mengambil expression rule "allow" langsung dari Cloudflare API
-// saat startup, supaya tidak perlu hardcode di kode.
-//
-// Uncomment pemanggilan fungsi ini di Run() jika ingin dynamic expression loading.
-func (m *Monitor) loadRuleExpression(ctx context.Context) error {
-	expr, err := m.waf.GetRuleExpression(ctx, m.cfg.CFRuleID)
-	if err != nil {
-		return fmt.Errorf("get rule expression: %w", err)
-	}
+// MultiMonitor mengelola lifecycle semua ZoneMonitor.
+// Bertanggung jawab untuk:
+//   - Fetch daftar zone dari Cloudflare saat startup
+//   - Spawn goroutine per zone
+//   - Refresh daftar zone secara berkala (zone baru otomatis terdeteksi)
+//   - Graceful shutdown semua goroutine sekaligus
+type MultiMonitor struct {
+	cfg      *config.Config
+	zoneClient *cloudflare.ZoneClient
+	telegram *notify.TelegramNotifier
 
-	if expr == "" {
-		return fmt.Errorf("rule expression is empty — check CF_RULE_ID configuration")
-	}
+	// mu melindungi akses ke activeMonitors
+	mu             sync.RWMutex
+	activeMonitors map[string]*ZoneMonitor // key: zone ID
+}
 
-	m.allowRuleExpr = expr
-	slog.Info("Rule expression loaded from Cloudflare API",
-		"rule_id", m.cfg.CFRuleID,
-		"expression", expr,
+// NewMultiMonitor membuat instance MultiMonitor baru.
+func NewMultiMonitor(cfg *config.Config, telegram *notify.TelegramNotifier) *MultiMonitor {
+	return &MultiMonitor{
+		cfg:            cfg,
+		zoneClient:     cloudflare.NewZoneClient(cfg.CFApiToken, cfg.CFAccountID),
+		telegram:       telegram,
+		activeMonitors: make(map[string]*ZoneMonitor),
+	}
+}
+
+// Run memulai orchestration loop. Blocking sampai ctx dibatalkan.
+func (m *MultiMonitor) Run(ctx context.Context) {
+	slog.Info("MultiMonitor starting",
+		"allow_rule_name", m.cfg.AllowRuleName,
+		"excluded_zones", m.cfg.ExcludedZones,
+		"zone_refresh_interval", m.cfg.ZoneRefreshInterval,
 	)
+
+	// Initial zone discovery dan spawn monitors
+	if err := m.discoverAndSpawn(ctx); err != nil {
+		slog.Error("Initial zone discovery failed", "error", err)
+		// Jangan exit — coba lagi saat refresh berikutnya
+	}
+
+	// Ticker untuk periodic zone refresh
+	// Berguna jika klien menambahkan domain baru ke account
+	refreshTicker := time.NewTicker(m.cfg.ZoneRefreshInterval)
+	defer refreshTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("MultiMonitor shutting down — waiting for all zone monitors...")
+			return
+		case <-refreshTicker.C:
+			slog.Info("Refreshing zone list...")
+			if err := m.discoverAndSpawn(ctx); err != nil {
+				slog.Error("Zone refresh failed", "error", err)
+			}
+		}
+	}
+}
+
+// discoverAndSpawn fetch semua zone, cari rule by name, lalu spawn monitor baru
+// untuk zone yang belum punya monitor.
+func (m *MultiMonitor) discoverAndSpawn(ctx context.Context) error {
+	discoverCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	zones, err := m.zoneClient.GetAllActiveZones(discoverCtx)
+	if err != nil {
+		return fmt.Errorf("get zones: %w", err)
+	}
+
+	newCount := 0
+	skippedCount := 0
+	errorCount := 0
+
+	for _, zone := range zones {
+		// Skip zone yang dikecualikan
+		if m.cfg.IsZoneExcluded(zone.Name) {
+			slog.Debug("Zone excluded", "zone", zone.Name)
+			skippedCount++
+			continue
+		}
+
+		// Skip zone yang sudah punya monitor aktif
+		m.mu.RLock()
+		_, exists := m.activeMonitors[zone.ID]
+		m.mu.RUnlock()
+		if exists {
+			continue
+		}
+
+		// Cari rule by name di zone ini
+		findCtx, findCancel := context.WithTimeout(ctx, 15*time.Second)
+		rule, err := m.zoneClient.FindRuleByName(findCtx, zone, m.cfg.AllowRuleName)
+		findCancel()
+
+		if err != nil {
+			// Rule tidak ditemukan di zone ini — skip dengan warning
+			// Ini normal jika ada zone yang struktur WAF-nya berbeda
+			slog.Warn("Rule not found in zone — skipping",
+				"zone", zone.Name,
+				"rule_name", m.cfg.AllowRuleName,
+				"error", err,
+			)
+			errorCount++
+			continue
+		}
+
+		// Spawn goroutine monitor untuk zone ini
+		zm := newZoneMonitor(m.cfg, rule, m.telegram)
+
+		m.mu.Lock()
+		m.activeMonitors[zone.ID] = zm
+		m.mu.Unlock()
+
+		// Jalankan di goroutine terpisah
+		go zm.run(ctx)
+
+		slog.Info("Zone monitor spawned",
+			"zone", zone.Name,
+			"zone_id", zone.ID,
+			"rule_id", rule.RuleID,
+			"ruleset_id", rule.RulesetID,
+		)
+		newCount++
+	}
+
+	slog.Info("Zone discovery complete",
+		"new_monitors", newCount,
+		"skipped_excluded", skippedCount,
+		"rule_not_found", errorCount,
+		"total_active", m.ActiveCount(),
+	)
+
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// Getters — untuk testing / health check endpoint
-// ---------------------------------------------------------------------------
-
-// CurrentState mengembalikan state saat ini (thread-safe read).
-func (m *Monitor) CurrentState() State {
-	return m.currentState
+// ActiveCount mengembalikan jumlah zone monitor yang aktif (thread-safe).
+func (m *MultiMonitor) ActiveCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.activeMonitors)
 }
 
-// PollCount mengembalikan jumlah total polling yang sudah dilakukan.
-func (m *Monitor) PollCount() int64 {
-	return atomic.LoadInt64(&m.pollCount)
-}
+// ActiveZones mengembalikan list domain yang sedang dimonitor (untuk logging/health).
+func (m *MultiMonitor) ActiveZones() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-// StateDuration mengembalikan berapa lama monitor berada di state saat ini.
-func (m *Monitor) StateDuration() time.Duration {
-	return time.Since(m.stateEnteredAt)
+	zones := make([]string, 0, len(m.activeMonitors))
+	for _, zm := range m.activeMonitors {
+		zones = append(zones, zm.rule.ZoneName)
+	}
+	return zones
 }

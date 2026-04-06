@@ -10,11 +10,17 @@ import (
 // Config menyimpan semua konfigurasi service yang dibaca dari environment variables.
 type Config struct {
 	// --- Cloudflare Credentials ---
-	CFApiToken  string // API Token dengan permission Zone:WAF:Edit dan Zone:Analytics:Read
-	CFZoneID    string // Zone ID domain yang diproteksi
-	CFAccountID string // Account ID Cloudflare
-	CFRulesetID string // Custom Ruleset ID (dari GET /zones/{id}/rulesets)
-	CFRuleID    string // Rule ID spesifik yang akan di-toggle (rule "allow")
+	CFApiToken  string // API Token: Zone:WAF:Edit + Zone:Analytics:Read + Zone:Zone:Read
+	CFAccountID string // Account ID — digunakan untuk filter zone saat listing
+
+	// --- Rule Discovery ---
+	// Nama rule yang akan di-toggle di SEMUA zone.
+	// Harus sama persis dengan field "description" di Cloudflare dashboard.
+	AllowRuleName string // default: "allow-countries-ip"
+
+	// Zone yang dikecualikan dari automasi (opsional).
+	// Format: comma-separated domain names, e.g. "staging.com,internal.com"
+	ExcludedZones []string
 
 	// --- Threshold & Timing ---
 	RPSThreshold     float64       // Batas RPS sebelum mitigasi aktif (default: 1000)
@@ -22,28 +28,27 @@ type Config struct {
 	CooldownDuration time.Duration // Berapa lama RPS harus stabil sebelum recovery (default: 15m)
 
 	// --- Polling ---
-	PollInterval time.Duration // Interval polling ke Cloudflare API (default: 60s)
+	PollInterval        time.Duration // Interval polling RPS (default: 60s)
+	ZoneRefreshInterval time.Duration // Seberapa sering re-fetch daftar zone (default: 1h)
+	// Zone refresh diperlukan agar zone baru yang ditambahkan ke account
+	// otomatis ter-detect tanpa perlu restart service.
 
 	// --- Telegram ---
-	TelegramBotToken string // Bot token dari @BotFather
-	TelegramChatID   string // Chat ID group (biasanya negatif, misal: -1001234567890)
+	TelegramBotToken string
+	TelegramChatID   string
 }
 
 // Load membaca konfigurasi dari environment variables.
-// Akan return error jika ada required variable yang tidak diset.
 func Load() (*Config, error) {
 	cfg := &Config{}
 
-	// --- Required fields ---
+	// --- Required ---
 	required := []struct {
 		key  string
 		dest *string
 	}{
 		{"CF_API_TOKEN", &cfg.CFApiToken},
-		{"CF_ZONE_ID", &cfg.CFZoneID},
 		{"CF_ACCOUNT_ID", &cfg.CFAccountID},
-		{"CF_RULESET_ID", &cfg.CFRulesetID},
-		{"CF_RULE_ID", &cfg.CFRuleID},
 	}
 
 	for _, r := range required {
@@ -54,7 +59,15 @@ func Load() (*Config, error) {
 		*r.dest = val
 	}
 
-	// --- Optional fields dengan default values ---
+	// --- Rule Discovery ---
+	cfg.AllowRuleName = getEnvOrDefault("ALLOW_RULE_NAME", "allow-countries-ip")
+
+	// Excluded zones: parse comma-separated
+	if raw := os.Getenv("EXCLUDED_ZONES"); raw != "" {
+		cfg.ExcludedZones = splitAndTrim(raw, ",")
+	}
+
+	// --- Threshold & Timing ---
 	var err error
 
 	cfg.RPSThreshold, err = parseFloat("RPS_THRESHOLD", "1000")
@@ -80,59 +93,103 @@ func Load() (*Config, error) {
 	}
 	cfg.PollInterval = time.Duration(pollSec) * time.Second
 
-	// Validasi: poll interval minimum 30 detik untuk menghindari abuse API
 	if cfg.PollInterval < 30*time.Second {
 		return nil, fmt.Errorf("POLL_INTERVAL_SECONDS must be >= 30, got %d", pollSec)
 	}
+
+	refreshHours, err := parseInt("ZONE_REFRESH_HOURS", "1")
+	if err != nil {
+		return nil, err
+	}
+	cfg.ZoneRefreshInterval = time.Duration(refreshHours) * time.Hour
 
 	// --- Telegram (opsional) ---
 	cfg.TelegramBotToken = os.Getenv("TELEGRAM_BOT_TOKEN")
 	cfg.TelegramChatID = os.Getenv("TELEGRAM_CHAT_ID")
 
-	// Validasi: jika salah satu diset, keduanya harus diset
 	if (cfg.TelegramBotToken == "") != (cfg.TelegramChatID == "") {
 		return nil, fmt.Errorf(
-			"both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set together, or both left empty",
+			"TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must both be set, or both left empty",
 		)
 	}
 
 	return cfg, nil
 }
 
-// TelegramEnabled mengembalikan true jika konfigurasi Telegram lengkap.
+// IsZoneExcluded memeriksa apakah sebuah domain dikecualikan dari automasi.
+func (c *Config) IsZoneExcluded(domainName string) bool {
+	for _, excluded := range c.ExcludedZones {
+		if excluded == domainName {
+			return true
+		}
+	}
+	return false
+}
+
+// TelegramEnabled mengembalikan true jika Telegram dikonfigurasi.
 func (c *Config) TelegramEnabled() bool {
 	return c.TelegramBotToken != "" && c.TelegramChatID != ""
 }
 
 // --- Helpers ---
 
-func parseFloat(envKey, defaultVal string) (float64, error) {
-	raw := getEnvOrDefault(envKey, defaultVal)
-	val, err := strconv.ParseFloat(raw, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid value for %s=%q: must be a number", envKey, raw)
+func parseFloat(key, def string) (float64, error) {
+	raw := getEnvOrDefault(key, def)
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("invalid %s=%q: must be a positive number", key, raw)
 	}
-	if val <= 0 {
-		return 0, fmt.Errorf("invalid value for %s=%q: must be > 0", envKey, raw)
-	}
-	return val, nil
+	return v, nil
 }
 
-func parseInt(envKey, defaultVal string) (int, error) {
-	raw := getEnvOrDefault(envKey, defaultVal)
-	val, err := strconv.Atoi(raw)
-	if err != nil {
-		return 0, fmt.Errorf("invalid value for %s=%q: must be an integer", envKey, raw)
+func parseInt(key, def string) (int, error) {
+	raw := getEnvOrDefault(key, def)
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("invalid %s=%q: must be a positive integer", key, raw)
 	}
-	if val <= 0 {
-		return 0, fmt.Errorf("invalid value for %s=%q: must be > 0", envKey, raw)
-	}
-	return val, nil
+	return v, nil
 }
 
-func getEnvOrDefault(key, defaultVal string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
+func getEnvOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	return defaultVal
+	return def
+}
+
+func splitAndTrim(s, sep string) []string {
+	var result []string
+	for _, part := range splitString(s, sep) {
+		trimmed := trimSpace(part)
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func splitString(s, sep string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i <= len(s)-len(sep); i++ {
+		if s[i:i+len(sep)] == sep {
+			parts = append(parts, s[start:i])
+			start = i + len(sep)
+			i += len(sep) - 1
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
+
+func trimSpace(s string) string {
+	start, end := 0, len(s)
+	for start < end && (s[start] == ' ' || s[start] == '\t') {
+		start++
+	}
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t') {
+		end--
+	}
+	return s[start:end]
 }

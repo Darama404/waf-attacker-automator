@@ -295,7 +295,7 @@ func (zm *ZoneMonitor) sendStatusUpdate(ctx context.Context, rps float64, pollCo
 		StateDuration: time.Since(zm.stateEnteredAt),
 	}
 
-	if err := zm.telegram.UpdateStatusMessage(ctx, tgCtx, zm.rule.ZoneID, report); err != nil {
+	if err := zm.telegram.UpdateStatusMessage(tgCtx, report); err != nil {
 		slog.Warn("Telegram status update failed", "zone", zm.rule.ZoneName, "error", err)
 	}
 }

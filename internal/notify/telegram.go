@@ -6,9 +6,7 @@ import (
     "encoding/json"
     "fmt"
     "io"
-    "log/slog"
     "net/http"
-    "sync"
     "time"
 )
 
@@ -18,10 +16,6 @@ type TelegramNotifier struct {
     botToken string
     chatID   string
     client   *http.Client
-
-    // Untuk edit-message strategy (live RPS report)
-    mu            sync.Mutex
-    statusMsgID   int // Message ID dari pesan status yang akan di-edit
 }
 
 func NewTelegramNotifier(botToken, chatID string) *TelegramNotifier {
@@ -116,16 +110,14 @@ func (t *TelegramNotifier) callAPI(ctx context.Context, method string, payload i
 // --- Public Notification Methods ---
 
 // NotifyMitigationActivated kirim alert baru (bukan edit) — event penting
-func (t *TelegramNotifier) NotifyMitigationActivated(ctx context.Context, zone string, rps float64, threshold float64) error {
+func (t *TelegramNotifier) NotifyMitigationActivated(ctx context.Context, zone string) error {
     text := fmt.Sprintf(
         "🚨 <b>WAF ALERT — MITIGATION ACTIVATED</b>\n\n"+
             "🌐 <b>Zone:</b> <code>%s</code>\n"+
-            "📈 <b>RPS Detected:</b> <code>%.0f req/s</code>\n"+
-            "⚠️ <b>Threshold:</b> <code>%.0f req/s</code>\n"+
             "🔄 <b>Action:</b> Rule changed <code>skip → managed_challenge</code>\n"+
             "🕐 <b>Time:</b> <code>%s</code>\n\n"+
             "Traffic dari whitelist countries sekarang mendapat challenge.",
-        zone, rps, threshold,
+        zone,
         time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
     )
 
@@ -134,15 +126,14 @@ func (t *TelegramNotifier) NotifyMitigationActivated(ctx context.Context, zone s
 }
 
 // NotifyMitigationDeactivated kirim alert baru — event penting
-func (t *TelegramNotifier) NotifyMitigationDeactivated(ctx context.Context, zone string, cooldownMin float64) error {
+func (t *TelegramNotifier) NotifyMitigationDeactivated(ctx context.Context, zone string) error {
     text := fmt.Sprintf(
         "✅ <b>WAF ALERT — MITIGATION DEACTIVATED</b>\n\n"+
             "🌐 <b>Zone:</b> <code>%s</code>\n"+
-            "🕒 <b>Stable for:</b> <code>%.0f minutes</code>\n"+
             "🔄 <b>Action:</b> Rule restored <code>managed_challenge → skip</code>\n"+
             "🕐 <b>Time:</b> <code>%s</code>\n\n"+
             "Traffic kembali normal. Rule allow dipulihkan.",
-        zone, cooldownMin,
+        zone,
         time.Now().UTC().Format("2006-01-02 15:04:05 UTC"),
     )
 
@@ -150,132 +141,7 @@ func (t *TelegramNotifier) NotifyMitigationDeactivated(ctx context.Context, zone
     return err
 }
 
-// UpdateStatusMessage update/edit pesan status live — dipanggil setiap polling
-// Strategi: kirim 1x saat pertama, lalu edit pesan yang sama → group tidak spam
-func (t *TelegramNotifier) UpdateStatusMessage(ctx context.Context, status *StatusReport) error {
-    t.mu.Lock()
-    defer t.mu.Unlock()
 
-    text := formatStatusMessage(status)
-
-    if t.statusMsgID == 0 {
-        // Belum ada pesan status — kirim baru
-        msgID, err := t.sendMessage(ctx, text)
-        if err != nil {
-            return fmt.Errorf("send initial status: %w", err)
-        }
-        t.statusMsgID = msgID
-        slog.Info("Telegram: initial status message sent", "msg_id", msgID)
-        return nil
-    }
-
-    // Edit pesan yang sudah ada
-    err := t.editMessage(ctx, t.statusMsgID, text)
-    if err != nil {
-        // Jika edit gagal (misal pesan terlalu lama / dihapus), kirim baru
-        slog.Warn("Telegram: edit failed, sending new status message", "error", err)
-        msgID, err2 := t.sendMessage(ctx, text)
-        if err2 != nil {
-            return fmt.Errorf("fallback send failed: %w", err2)
-        }
-        t.statusMsgID = msgID
-    }
-
-    return nil
-}
-
-// --- Status Report Struct & Formatter ---
-
-type StatusReport struct {
-    Zone         string
-    CurrentRPS   float64
-    Threshold    float64
-    State        string
-    PollCount    int64
-    LastPollTime time.Time
-    // Durasi state saat ini
-    StateDuration time.Duration
-}
-
-func formatStatusMessage(s *StatusReport) string {
-    // State indicator
-    stateIcon := map[string]string{
-        "NORMAL":       "🟢",
-        "BREACHING":    "🟡",
-        "MITIGATING":   "🔴",
-        "COOLING_DOWN": "🔵",
-    }
-    icon := stateIcon[s.State]
-    if icon == "" {
-        icon = "⚪"
-    }
-
-    // RPS bar visual (max 20 karakter, threshold = 100%)
-    rpsBar := buildRPSBar(s.CurrentRPS, s.Threshold)
-
-    return fmt.Sprintf(
-        "📊 <b>WAF Monitor — Live Status</b>\n"+
-            "━━━━━━━━━━━━━━━━━━━━\n"+
-            "🌐 <b>Zone:</b> <code>%s</code>\n"+
-            "%s <b>State:</b> <code>%s</code>\n"+
-            "⏱ <b>In state for:</b> <code>%s</code>\n"+
-            "━━━━━━━━━━━━━━━━━━━━\n"+
-            "📈 <b>Current RPS:</b> <code>%.1f req/s</code>\n"+
-            "🎯 <b>Threshold:</b>   <code>%.0f req/s</code>\n"+
-            "%s\n"+
-            "━━━━━━━━━━━━━━━━━━━━\n"+
-            "🔄 Poll #%d | 🕐 <code>%s</code>",
-        s.Zone,
-        icon, s.State,
-        formatDuration(s.StateDuration),
-        s.CurrentRPS,
-        s.Threshold,
-        rpsBar,
-        s.PollCount,
-        s.LastPollTime.UTC().Format("15:04:05 UTC"),
-    )
-}
-
-// buildRPSBar membuat visual bar RPS relatif terhadap threshold
-func buildRPSBar(rps, threshold float64) string {
-    const barLen = 10
-    ratio := rps / threshold
-    if ratio > 2 {
-        ratio = 2 // Cap di 200%
-    }
-    filled := int(ratio * float64(barLen))
-    if filled > barLen {
-        filled = barLen
-    }
-
-    bar := ""
-    for i := 0; i < barLen; i++ {
-        if i < filled {
-            if ratio >= 1.0 {
-                bar += "🟥"
-            } else if ratio >= 0.7 {
-                bar += "🟧"
-            } else {
-                bar += "🟩"
-            }
-        } else {
-            bar += "⬜"
-        }
-    }
-
-    percentage := ratio * 100
-    return fmt.Sprintf("%s <code>%.0f%%</code> of threshold", bar, percentage)
-}
-
-func formatDuration(d time.Duration) string {
-    if d < time.Minute {
-        return fmt.Sprintf("%ds", int(d.Seconds()))
-    }
-    if d < time.Hour {
-        return fmt.Sprintf("%dm %ds", int(d.Minutes()), int(d.Seconds())%60)
-    }
-    return fmt.Sprintf("%dh %dm", int(d.Hours()), int(d.Minutes())%60)
-}
 
 // NotifyStartup kirim pesan saat service pertama kali jalan
 func (t *TelegramNotifier) NotifyStartup(ctx context.Context, zone string, version string) error {

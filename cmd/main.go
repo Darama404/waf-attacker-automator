@@ -4,16 +4,17 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"waf-attacker-automator/internal/cloudflare"
 	"waf-attacker-automator/internal/config"
-	"waf-attacker-automator/internal/monitor"
+	"waf-attacker-automator/internal/executor"
 	"waf-attacker-automator/internal/notify"
+	"waf-attacker-automator/internal/webhook"
 )
 
 var version = "dev"
@@ -46,11 +47,7 @@ func main() {
 		"account_id", cfg.CFAccountID,
 		"allow_rule_name", cfg.AllowRuleName,
 		"excluded_zones", cfg.ExcludedZones,
-		"rps_threshold", cfg.RPSThreshold,
-		"trigger_duration", cfg.TriggerDuration,
-		"cooldown_duration", cfg.CooldownDuration,
-		"poll_interval", cfg.PollInterval,
-		"zone_refresh_interval", cfg.ZoneRefreshInterval,
+		"webhook_port", cfg.WebhookPort,
 		"telegram_enabled", cfg.TelegramEnabled(),
 	)
 
@@ -79,9 +76,26 @@ func main() {
 	}
 
 	// ---------------------------------------------------------------------------
-	// Multi-zone Monitor
+	// Action Executor & Cache
 	// ---------------------------------------------------------------------------
-	multi := monitor.NewMultiMonitor(cfg, tgNotifier)
+	exec := executor.NewExecutor(cfg, tgNotifier)
+
+	// Fetch rules to build cache at startup
+	if err := exec.Discover(context.Background()); err != nil {
+		slog.Error("Failed to discover zones and rules at startup", "error", err)
+	}
+
+	// ---------------------------------------------------------------------------
+	// Webhook Server
+	// ---------------------------------------------------------------------------
+	webhookHandler := webhook.NewHandler(exec)
+	mux := http.NewServeMux()
+	mux.Handle("/webhook/cloudflare-trigger", webhookHandler)
+	
+	httpServer := &http.Server{
+		Addr:    ":" + cfg.WebhookPort,
+		Handler: mux,
+	}
 
 	// ---------------------------------------------------------------------------
 	// Graceful Shutdown
@@ -91,35 +105,31 @@ func main() {
 
 	done := make(chan struct{})
 	go func() {
-		defer close(done)
-		multi.Run(ctx)
+		slog.Info("Starting webhook server", "port", cfg.WebhookPort)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Webhook server error", "error", err)
+		}
+		close(done)
 	}()
 
 	<-ctx.Done()
-	slog.Info("Shutdown signal received",
-		"active_zones", multi.ActiveCount(),
-		"zones", strings.Join(multi.ActiveZones(), ", "),
-	)
+	slog.Info("Shutdown signal received", "cached_zones", exec.GetCachedZoneCount())
 
-	// Beri waktu 30 detik untuk semua goroutine selesai
-	shutdownTimer := time.NewTimer(30 * time.Second)
-	defer shutdownTimer.Stop()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	select {
-	case <-done:
-		slog.Info("All monitors stopped cleanly")
-	case <-shutdownTimer.C:
-		slog.Warn("Forced exit after 30s shutdown timeout")
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("HTTP server shutdown error", "error", err)
 	}
 
 	// Kirim notifikasi shutdown
 	if tgNotifier != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = tgNotifier.NotifyShutdown(shutdownCtx, "all zones", int64(multi.ActiveCount()))
+		tgShutdownCtx, cancelTg := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelTg()
+		_ = tgNotifier.NotifyShutdown(tgShutdownCtx, "all zones", int64(exec.GetCachedZoneCount()))
 	}
 
-	slog.Info("WAF Automator exited", "monitored_zones", multi.ActiveCount())
+	slog.Info("WAF Automator exited", "monitored_zones", exec.GetCachedZoneCount())
 }
 
 // ---------------------------------------------------------------------------
@@ -173,11 +183,7 @@ Optional environment variables (with defaults):
   ALLOW_RULE_NAME              allow-countries-ip   Description of rule to toggle
   EXCLUDED_ZONES               (empty)              Comma-separated domains to skip
                                                     e.g. "staging.com,internal.com"
-  RPS_THRESHOLD                1000                 RPS limit before mitigation
-  TRIGGER_DURATION_MINUTES     2                    Minutes breach must persist
-  COOLDOWN_DURATION_MINUTES    15                   Minutes stable before recovery
-  POLL_INTERVAL_SECONDS        60                   Polling interval (min: 30)
-  ZONE_REFRESH_HOURS           1                    How often to re-check zone list
+  WEBHOOK_PORT                 8080                 Port to listen for webhooks
   LOG_LEVEL                    info                 "debug" for verbose output
 
 Telegram (both required if either is set):

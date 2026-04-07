@@ -129,14 +129,14 @@ func (z *ZoneClient) GetAllActiveZones(ctx context.Context) ([]Zone, error) {
 // ruleName harus sama persis dengan field "description" rule di Cloudflare dashboard.
 // Contoh: "allow-countries-ip"
 func (z *ZoneClient) FindRuleByName(ctx context.Context, zone Zone, ruleName string) (*ZoneRule, error) {
-	url := fmt.Sprintf(listRulesetsEndpoint, zone.ID)
+	// Step 1: Get list ruleset untuk dapat ruleset ID
+	listURL := fmt.Sprintf(listRulesetsEndpoint, zone.ID)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, listURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+z.apiToken)
-	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := z.http.Do(req)
 	if err != nil {
@@ -150,45 +150,82 @@ func (z *ZoneClient) FindRuleByName(ctx context.Context, zone Zone, ruleName str
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d for zone %s: %s",
-			resp.StatusCode, zone.Name, truncate(string(body), 200))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
 	}
 
-	var result listRulesetsResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
+	var listResult listRulesetsResponse
+	if err := json.Unmarshal(body, &listResult); err != nil {
+		return nil, fmt.Errorf("decode list response: %w", err)
 	}
 
-	if !result.Success {
-		if len(result.Errors) > 0 {
-			return nil, fmt.Errorf("API error: %s", result.Errors[0].Message)
-		}
-		return nil, fmt.Errorf("API returned success=false")
-	}
-
-	// Cari di semua ruleset — prioritaskan phase http_request_firewall_custom
-	for _, ruleset := range result.Result {
-		if ruleset.Phase != "http_request_firewall_custom" {
-			continue
-		}
-		for _, rule := range ruleset.Rules {
-			// Case-insensitive match pada description
-			if strings.EqualFold(rule.Description, ruleName) {
-				return &ZoneRule{
-					ZoneID:      zone.ID,
-					ZoneName:    zone.Name,
-					RulesetID:   ruleset.ID,
-					RuleID:      rule.ID,
-					Description: rule.Description,
-					Expression:  rule.Expression,
-					Action:      rule.Action,
-				}, nil
-			}
+	// Step 2: Cari ruleset phase http_request_firewall_custom
+	var targetRulesetID string
+	for _, rs := range listResult.Result {
+		if rs.Phase == "http_request_firewall_custom" {
+			targetRulesetID = rs.ID
+			break
 		}
 	}
 
-	return nil, fmt.Errorf("rule %q not found in zone %s — pastikan nama rule sesuai dengan description di dashboard",
-		ruleName, zone.Name)
+	if targetRulesetID == "" {
+		return nil, fmt.Errorf("no custom WAF ruleset found in zone %s", zone.Name)
+	}
+
+	// Step 3: GET detail ruleset untuk dapat rules
+	detailURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/rulesets/%s",
+		zone.ID, targetRulesetID)
+
+	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, detailURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create detail request: %w", err)
+	}
+	req2.Header.Set("Authorization", "Bearer "+z.apiToken)
+
+	resp2, err := z.http.Do(req2)
+	if err != nil {
+		return nil, fmt.Errorf("execute detail request: %w", err)
+	}
+	defer resp2.Body.Close()
+
+	body2, err := io.ReadAll(resp2.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read detail body: %w", err)
+	}
+
+	// Parse detail ruleset
+	var detailResult struct {
+		Success bool `json:"success"`
+		Result  struct {
+			ID    string `json:"id"`
+			Rules []struct {
+				ID          string `json:"id"`
+				Description string `json:"description"`
+				Expression  string `json:"expression"`
+				Action      string `json:"action"`
+			} `json:"rules"`
+		} `json:"result"`
+	}
+
+	if err := json.Unmarshal(body2, &detailResult); err != nil {
+		return nil, fmt.Errorf("decode detail response: %w", err)
+	}
+
+	// Step 4: Cari rule by description
+	for _, rule := range detailResult.Result.Rules {
+		if strings.EqualFold(rule.Description, ruleName) {
+			return &ZoneRule{
+				ZoneID:      zone.ID,
+				ZoneName:    zone.Name,
+				RulesetID:   targetRulesetID,
+				RuleID:      rule.ID,
+				Description: rule.Description,
+				Expression:  rule.Expression,
+				Action:      rule.Action,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("rule %q not found in zone %s", ruleName, zone.Name)
 }
 
 // ---------------------------------------------------------------------------
